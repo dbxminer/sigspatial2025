@@ -1,0 +1,1 @@
+To run the code, kindly download porto and beijing tractory datasets as 'porto_trajectories.csv' and 'bj_trajectories.csv' from the LibCity paper (refer to the PDF) and place it in the main directory. Then run the two python codes to replicate our results in the paper. I'm unable to attach the files here because of their massive size.
