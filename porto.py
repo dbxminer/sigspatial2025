@@ -222,17 +222,23 @@ def high_utility_pattern_mining(
         nxt  = generate_next_level(prev, pruned, level1_set)
         if not nxt:
             break
-        # score = freq × cosine_similarity(category_ctx, itemset_ctx)
+        # compute utility score = freq × cosine_similarity(category_ctx, route_poi_context)
         scored = []
         for I, freq in nxt.items():
-            # itemset context
-            ctx_I = {k:0.0 for k in keywords}
+            # build weighted POI-context for this itemset:
+            # weight each POI by how many edges in I it belongs to
+            poi_weights = defaultdict(int)
             for e in I:
                 poi_idxs = roads_df.loc[roads_df[geo_col]==e, "poi_index"]\
                                  .dropna().astype(int).unique()
-                edge_ctx = poi_context.get(int(poi_idxs[0]), {}) if len(poi_idxs)>0 else {}
-                for kw, v in edge_ctx.items(): ctx_I[kw] += v
-            for kw in ctx_I: ctx_I[kw] /= len(I)
+                for poi_idx in poi_idxs:
+                    poi_weights[poi_idx] += 1
+            total_w = sum(poi_weights.values()) or 1
+            ctx_I = {k:0.0 for k in keywords}
+            for poi_idx, w in poi_weights.items():
+                for kw, val in poi_context[poi_idx].items():
+                    ctx_I[kw] += (w / total_w) * val
+            # now compute similarity to the category context
             sim_cat = cosine_similarity(category_ctx, ctx_I)
             scored.append((I, freq * sim_cat))
         scored.sort(key=lambda x: x[1], reverse=True)
@@ -512,9 +518,6 @@ if __name__ == "__main__":
             })
 
     # print CSV table
-    print("top_k_paths,num_paths,util_comp_time,total_high,total_freq")
+    print("top_k_paths,num_paths,util_comp_time,freq_comp_time,total_high,total_freq")
     for r in results:
-        print(f"{r['top_k_paths']},{r['num_paths']},"
-              f"{r['util_comp_time']:.4f},"
-              f"{r['total_high']:.4f},"
-              f"{r['total_freq']:.4f}")
+        print(f"{r['top_k_paths']},{r['num_paths']},"f"{r['util_comp_time']:.4f},"f"{r['freq_comp_time']:.4f},"f"{r['total_high']:.4f},"f"{r['total_freq']:.4f}")
