@@ -1,3 +1,1 @@
 To run the code, kindly download porto and beijing tractory datasets as 'porto_trajectories.csv' and 'bj_trajectories.csv' from the LibCity repository (https://github.com/LibCity/Bigscity-LibCity-Datasets) and place it in the main directory. Then run the two python codes to replicate our results in the paper. I'm unable to attach the trajectory datasets here because of their massive size.
-
-The graphs can be plotted by running the harryplotter.py file.
