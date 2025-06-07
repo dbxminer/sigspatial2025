@@ -4,9 +4,9 @@ import ast
 import networkx as nx
 import time
 from collections import defaultdict
-from itertools import combinations, islice
 from typing import Dict, List, Any
 from tqdm import tqdm
+
 def generate_fixed_length_paths(
     G: nx.Graph,
     start: Any,
@@ -111,7 +111,6 @@ def get_visited_trajectories_and_stats(
         lambda r: visited_cats_for_one(r["path"], r["tlist"]), axis=1
     )
 
-    # synthetic contexts
     keywords = [f"kw{i}" for i in range(1,101)]
     poi_context: Dict[int, Dict[str,float]] = {}
     for poi_idx in pois["poi_index"].astype(int):
@@ -120,36 +119,42 @@ def get_visited_trajectories_and_stats(
         w     /= w.sum()
         poi_context[poi_idx] = dict(zip(chosen, w))
 
-    # category contexts
     category_context: Dict[str, Dict[str,float]] = {}
     for cat in roads["cat"].unique():
         poi_idxs = pois.loc[pois[poi_cat_col]==cat, "poi_index"].astype(int).tolist()
         freqs    = np.array([poi_visit_counts[i] for i in poi_idxs], float)
-        if freqs.sum()==0:
+        if freqs.sum() == 0:
             category_context[cat] = {k:0.0 for k in keywords}
         else:
-            weights = freqs/freqs.sum()
+            weights = freqs / freqs.sum()
             rep = {k:0.0 for k in keywords}
             for poi_idx, wt in zip(poi_idxs, weights):
                 for kw, val in poi_context[poi_idx].items():
                     rep[kw] += wt * val
             category_context[cat] = rep
 
-    # edge utilities
     edge_utility: Dict[int,float] = {}
     for edge_id, cnt in edge_visit_counts.items():
         if cnt >= min_edge_visits:
-            cat     = roads.loc[roads[geo_col]==edge_id, "cat"].iloc[0]
-            ctx_cat = category_context[cat]
-            poi_idxs= (
+            cat         = roads.loc[roads[geo_col]==edge_id, "cat"].iloc[0]
+            cat_context = category_context[cat]
+            poi_idxs    = (
                 roads.loc[roads[geo_col]==edge_id, "poi_index"]
                      .dropna().astype(int).unique()
             )
-            ctx_poi = poi_context.get(int(poi_idxs[0]), {}) if len(poi_idxs)>0 else {}
-            edge_utility[edge_id] = cosine_similarity(ctx_cat, ctx_poi)
+            if len(poi_idxs) == 0:
+                continue
+            edge_ctx = {k: 0.0 for k in keywords}
+            for poi_idx in poi_idxs:
+                for kw, val in poi_context.get(int(poi_idx), {}).items():
+                    edge_ctx[kw] += val
+            for kw in edge_ctx:
+                edge_ctx[kw] /= len(poi_idxs)
+            cos_sim_val = cosine_similarity(cat_context, edge_ctx)
+            edge_utility[edge_id] = 1 - cos_sim_val
 
     cleaned = traj[
-        traj["path"].apply(lambda p: any(edge_utility.get(e,0.0)>0 for e in p))
+        traj["path"].apply(lambda p: any(edge_utility.get(e, 0.0) > 0 for e in p))
     ].reset_index(drop=True)
 
     return {
@@ -164,29 +169,23 @@ def get_visited_trajectories_and_stats(
         "roads_df":            roads
     }
 
-# ── Level‐wise itemset generation ────────────────────────────────────────────
-
 def generate_next_level(prev_itemsets, transactions, level1_set):
     new_counts = defaultdict(int)
     prev_set   = set(prev_itemsets)
     for I in tqdm(prev_itemsets, desc="Generating next level", unit="iset"):
         hi = max(I)
         for trans in transactions:
-            if set(I).issubset(trans):
-                items = set(trans)
-                for j in items:
-                    if j > hi and j:
-                        C = tuple(sorted(I + (j,)))
-                        new_counts[C] += 1
-                lower = [j for j in items if j < hi and j not in I]
-                for j in lower:
-                    TI = tuple(sorted((j,) + tuple(x for x in I if x != hi)))
-                    if TI not in prev_set:
-                        C = tuple(sorted(TI + (hi,)))
-                        new_counts[C] += 1
+            if not trans or hi not in trans:
+                continue
+            TI = tuple(e for e in trans if e > hi)
+            for e2 in TI:
+                if e2 in I:
+                    break
+            else:
+                if TI and TI not in prev_set:
+                    C = tuple(sorted(TI + (hi,)))
+                    new_counts[C] += 1
     return dict(new_counts)
-
-# ── High‐Utility pattern mining ───────────────────────────────────────────────
 
 def high_utility_pattern_mining(
     transactions: List[List[int]],
@@ -195,26 +194,22 @@ def high_utility_pattern_mining(
     max_levels: int,
     max_itemsets_per_level: int,
     poi_context: Dict[int,Dict[str,float]],
-    category_ctx: Dict[str, float],
-    query_ctx: Dict[str, float],
+    category_context: Dict[str, float],
+    query_context: Dict[str, float],
     roads_df: pd.DataFrame,
     geo_col: str,
     keywords: List[str],
     chi: int,
     edge_utility: Dict[int,float]
 ) -> (List[tuple], Dict[tuple, float]):
-    # level-1: top-k by frequency * edge utility
     topk = sorted(
         edge_visit_counts,
         key=lambda e: edge_visit_counts[e] * edge_utility.get(e, 0.0),
         reverse=True
     )[:k]
     level1_set = set(topk)
-
     pruned = [set(e for e in path if e in level1_set) for path in transactions]
     pruned = [t for t in pruned if t]
-
-    # build all levels
     itemsets = {1: { (e,): edge_visit_counts[e] for e in topk }}
     lvl = 1
     while lvl < max_levels:
@@ -222,11 +217,8 @@ def high_utility_pattern_mining(
         nxt  = generate_next_level(prev, pruned, level1_set)
         if not nxt:
             break
-        # compute utility score = freq × cosine_similarity(category_ctx, route_poi_context)
         scored = []
         for I, freq in nxt.items():
-            # build weighted POI-context for this itemset:
-            # weight each POI by how many edges in I it belongs to
             poi_weights = defaultdict(int)
             for e in I:
                 poi_idxs = roads_df.loc[roads_df[geo_col]==e, "poi_index"]\
@@ -238,34 +230,33 @@ def high_utility_pattern_mining(
             for poi_idx, w in poi_weights.items():
                 for kw, val in poi_context[poi_idx].items():
                     ctx_I[kw] += (w / total_w) * val
-            # now compute similarity to the category context
-            sim_cat = cosine_similarity(category_ctx, ctx_I)
-            scored.append((I, freq * sim_cat))
+            cos_sim = cosine_similarity(category_context, ctx_I)
+            utility_val = 1 - cos_sim
+            scored.append((I, freq * utility_val))
         scored.sort(key=lambda x: x[1], reverse=True)
         keep = [I for I,_ in scored[:max_itemsets_per_level]]
         itemsets[lvl+1] = {I: nxt[I] for I in keep}
         lvl += 1
-
-    # flatten all patterns with sims vs. query
     all_items = {}
     for lvl_sets in itemsets.values():
         all_items.update(lvl_sets)
     sims = {}
     for I in all_items:
         ctx_I = {k:0.0 for k in keywords}
+        total_pois = 0
         for e in I:
             poi_idxs = roads_df.loc[roads_df[geo_col]==e, "poi_index"]\
                              .dropna().astype(int).unique()
-            edge_ctx = poi_context.get(int(poi_idxs[0]), {}) if len(poi_idxs)>0 else {}
-            for kw, v in edge_ctx.items(): ctx_I[kw] += v
-        for kw in ctx_I: ctx_I[kw] /= len(I)
-        sims[I] = cosine_similarity(query_ctx, ctx_I)
-
-    # select top-chi itemsets by query similarity
+            for poi_idx in poi_idxs:
+                for kw, val in poi_context.get(int(poi_idx), {}).items():
+                    ctx_I[kw] += val
+            total_pois += len(poi_idxs)
+        if total_pois > 0:
+            for kw in ctx_I:
+                ctx_I[kw] /= total_pois
+        sims[I] = cosine_similarity(query_context, ctx_I)
     top_chi = [I for I,_ in sorted(sims.items(), key=lambda x: x[1], reverse=True)[:chi]]
     return top_chi, sims
-
-# ── Frequent pattern mining (all levels) ──────────────────────────────────────
 
 def frequent_pattern_mining(
     transactions: List[List[int]],
@@ -273,14 +264,13 @@ def frequent_pattern_mining(
     k: int,
     max_levels: int,
     max_itemsets_per_level: int,
-    query_ctx: Dict[str, float],
+    query_context: Dict[str, float],
     poi_context: Dict[int,Dict[str,float]],
     roads_df: pd.DataFrame,
     geo_col: str,
     keywords: List[str],
     chi: int
 ) -> (List[tuple], Dict[tuple, float]):
-    # identical level-wise generation
     topk = sorted(edge_visit_counts, key=lambda e: edge_visit_counts[e], reverse=True)[:k]
     level1_set = set(topk)
     pruned = [set(e for e in path if e in level1_set) for path in transactions]
@@ -299,24 +289,23 @@ def frequent_pattern_mining(
     all_items = {}
     for lvl_sets in itemsets.values():
         all_items.update(lvl_sets)
-
-    # compute sims for scoring only (not for selection)
     sims = {}
     for I in all_items:
         ctx_I = {k:0.0 for k in keywords}
+        total_pois = 0
         for e in I:
             poi_idxs = roads_df.loc[roads_df[geo_col]==e, "poi_index"]\
                              .dropna().astype(int).unique()
-            edge_ctx = poi_context.get(int(poi_idxs[0]), {}) if len(poi_idxs)>0 else {}
-            for kw, v in edge_ctx.items(): ctx_I[kw] += v
-        for kw in ctx_I: ctx_I[kw] /= len(I)
-        sims[I] = cosine_similarity(query_ctx, ctx_I)
-
-    # select top-chi frequent itemsets by frequency
+            for poi_idx in poi_idxs:
+                for kw, val in poi_context.get(int(poi_idx), {}).items():
+                    ctx_I[kw] += val
+            total_pois += len(poi_idxs)
+        if total_pois > 0:
+            for kw in ctx_I:
+                ctx_I[kw] /= total_pois
+        sims[I] = cosine_similarity(query_context, ctx_I)
     top_chi = [I for I,_ in sorted(all_items.items(), key=lambda x: x[1], reverse=True)[:chi]]
     return top_chi, sims
-
-# ── Graph & path utilities ───────────────────────────────────────────────────
 
 def build_edge_graph(rel_fp: str, origin_col="origin_id", dest_col="destination_id") -> nx.Graph:
     df = pd.read_csv(rel_fp)
@@ -328,30 +317,19 @@ def build_edge_graph(rel_fp: str, origin_col="origin_id", dest_col="destination_
 def compute_top5_edges(edge_visit_counts: Dict[int,int]) -> List[int]:
     return sorted(edge_visit_counts, key=lambda e: edge_visit_counts[e], reverse=True)[:10]
 
-
 def compute_path_utility(
     G: nx.Graph,
-    edge_pairs: List,
+    edge_pairs: List[int],
     chi_itemsets: List[tuple],
     sims: Dict[tuple,float],
-    num_paths: int = 10,
-    top_k_paths: int = 3,
-    selection_mode: str = "freq"
+    num_paths: int,
+    top_k_paths: int,
+    selection_mode: str,
+    path_length: int
 ) -> float:
-    """
-    Compute total utility over edge_pairs by selecting top_k_paths per pair.
-    - selection_mode="freq": select paths by overlap count;
-    - selection_mode="utility": select paths by overlap * sim score.
-
-    Total utility (for both): sum over chosen paths of 
-"
-    "   overlap_count(edge_set, I) * sims[I] for each I in chi_itemsets.
-    """
     total = 0.0
     for e1 in edge_pairs:
-        # get candidate paths
-        paths = generate_fixed_length_paths(G, e1, 50, num_paths)
-        # score each path based on selection mode
+        paths = generate_fixed_length_paths(G, e1, path_length, num_paths)
         if selection_mode == "freq":
             scores = [
                 (p, sum(1 for I in chi_itemsets if set(I).issubset(p)))
@@ -362,24 +340,16 @@ def compute_path_utility(
             for p in paths:
                 score = 0.0
                 for I in chi_itemsets:
-                    setI = set(I)
-                    overlap_items = setI.intersection(p)
-                    percent_I = len(overlap_items) / len(I) if I else 0
-                    score += percent_I * sims.get(I, 0.0)
+                    overlap = len(set(I).intersection(p)) / len(I) if I else 0
+                    score += overlap * sims.get(I, 0.0)
                 scores.append((p, score))
-        # pick top_k_paths
         scores.sort(key=lambda x: x[1], reverse=True)
         chosen = [p for p, _ in scores[:top_k_paths]]
-        # accumulate total utility: overlap * sim
         for path in chosen:
             for I in chi_itemsets:
-                setI = set(I)
-                overlap_items = setI.intersection(path)
-                percent_I = len(overlap_items) / len(I) if I else 0
-                total += percent_I * sims.get(I, 0.0)
+                overlap = len(set(I).intersection(path)) / len(I) if I else 0
+                total += overlap * sims.get(I, 0.0)
     return total
-
-# ── Main comparison: high‐utility vs. frequent ───────────────────────────────
 
 if __name__ == "__main__":
     POIS_CSV   = "BJ_POIs.csv"
@@ -395,7 +365,6 @@ if __name__ == "__main__":
     max_per_lvl  = 300
     chi          = 100
 
-    # load and preprocess once
     stats = get_visited_trajectories_and_stats(
         POIS_CSV, ROADS_CSV, TRAJ_CSV,
         threshold, zipf_param, min_visits
@@ -404,7 +373,7 @@ if __name__ == "__main__":
     freq_counts      = stats["edge_visit_counts"]
     nonvisit_counts  = stats["edge_nonvisit_counts"]
     total_counts     = {e: freq_counts.get(e,0) + nonvisit_counts.get(e,0)
-                         for e in set(freq_counts) | set(nonvisit_counts)}
+                        for e in set(freq_counts) | set(nonvisit_counts)}
     categories       = stats["category_list"]
     poi_context      = stats["poi_context"]
     category_context = stats["category_context"]
@@ -414,27 +383,26 @@ if __name__ == "__main__":
     top5_edges_global= compute_top5_edges(freq_counts)
     G                = build_edge_graph(REL_CSV)
 
-    # build query_context per category
     query_context: Dict[str, Dict[str,float]] = {}
     for cat in categories:
-        chosen = np.random.choice(keywords,20,replace=False)
-        w = np.random.rand(20); w/=w.sum()
+        chosen = np.random.choice(keywords, 20, replace=False)
+        w = np.random.rand(20); w /= w.sum()
         qc = {k:0.0 for k in keywords}
-        for kw,wt in zip(chosen,w): qc[kw] = wt
+        for kw, wt in zip(chosen, w):
+            qc[kw] = wt
         query_context[cat] = qc
 
-    # pre-mine itemsets once per category
     high_itemsets = {}
     freq_itemsets = {}
     high_sims_all = {}
     freq_sims_all = {}
-    util_build_time = time.time() -time.time()
-    freq_build_time = time.time() -time.time()
 
     for cat in categories:
         paths = cleaned.loc[
-            cleaned["visited_cats"].apply(lambda s,c=cat: c in s), "path"
+            cleaned["visited_cats"].apply(lambda s, c=cat: c in s), "path"
         ].tolist()
+        print(f"Category {cat}: {len(paths)} transactions")
+
         util_build_start = time.time()
         high_chi, sims_high = high_utility_pattern_mining(
             paths, freq_counts,
@@ -442,17 +410,17 @@ if __name__ == "__main__":
             max_levels=max_lvls,
             max_itemsets_per_level=max_per_lvl,
             poi_context=poi_context,
-            category_ctx=category_context[cat],
-            query_ctx=query_context[cat],
+            category_context=category_context[cat],
+            query_context=query_context[cat],
             roads_df=roads,
             geo_col=geo_col,
             keywords=keywords,
             chi=chi,
             edge_utility=stats["edge_utility"]
         )
-        util_build_time += time.time() - util_build_start
+        util_build_time = time.time() - util_build_start
         print(str(cat))
-        print(str(time.time() - util_build_start))
+        print(str(util_build_time))
         high_itemsets[cat] = high_chi
         high_sims_all[cat]  = sims_high
 
@@ -462,62 +430,142 @@ if __name__ == "__main__":
             k=topk_items,
             max_levels=max_lvls,
             max_itemsets_per_level=max_per_lvl,
-            query_ctx=query_context[cat],
+            query_context=query_context[cat],
             poi_context=poi_context,
             roads_df=roads,
             geo_col=geo_col,
             keywords=keywords,
             chi=chi
         )
-        freq_build_time += time.time() - freq_build_start
+        freq_build_time = time.time() - freq_build_start
         print(str(cat))
-        print(str(time.time() - freq_build_start))
+        print(str(freq_build_time))
         freq_itemsets[cat] = freq_chi
         freq_sims_all[cat] = sims_freq
 
-    # experiment varying parameters, only recompute utility
-    k_paths_list    = list(range(5, 15))  # 5..10
-    num_paths_list  = list(range(50, 151, 10))  # 50,60,..100
+    # experiment: vary one parameter at a time
+    k_paths_list     = list(range(5, 15))
+    num_paths_list   = list(range(50, 151, 10))
+    path_lengths_list= list(range(20, 101, 20))
+
+    DEFAULT_K_PATHS     = 10
+    DEFAULT_NUM_PATHS   = 100
+    DEFAULT_PATH_LENGTH = 60
+
     results = []
 
-    print(str(util_build_time))
-    print(str(freq_build_time))
+    # vary top_k_paths
+    for top_k_paths in k_paths_list:
+        total_high = total_freq = util_time = freq_time = 0.0
+        for cat in categories:
+            t0 = time.time()
+            hi = compute_path_utility(
+                G, top5_edges_global,
+                high_itemsets[cat], high_sims_all[cat],
+                DEFAULT_NUM_PATHS, top_k_paths,
+                selection_mode="utility",
+                path_length=DEFAULT_PATH_LENGTH
+            )
+            util_time += time.time() - t0
+            total_high += hi
 
-    for top_k_paths in tqdm(k_paths_list, desc="Top-K Paths", unit="kpath"):
-        for num_paths in tqdm(num_paths_list, desc="Num Paths", unit="npath", leave=False):
-            freq_start = time.time()-time.time()
-            util_start = time.time()-time.time()
-            total_high = 0.0
-            total_freq = 0.0
-            for cat in categories:
-                freq_time = time.time()
-                hi = compute_path_utility(
-                    G, top5_edges_global,
-                    high_itemsets[cat], high_sims_all[cat],
-                    num_paths=num_paths, top_k_paths=top_k_paths,
-                    selection_mode="utility"
-                )
-                total_high += hi
-                freq_start += time.time() - freq_time
-                util_time = time.time()
-                fe = compute_path_utility(
-                    G, top5_edges_global,
-                    freq_itemsets[cat], freq_sims_all[cat],
-                    num_paths=num_paths, top_k_paths=top_k_paths,
-                    selection_mode="freq"
-                )
-                total_freq += fe
-                util_start += time.time() - util_time
-            results.append({
-                'top_k_paths': top_k_paths,
-                'num_paths': num_paths,
-                'util_comp_time': freq_start,
-                'freq_comp_time': util_start,
-                'total_high': total_high,
-                'total_freq': total_freq
-            })
+            t1 = time.time()
+            fe = compute_path_utility(
+                G, top5_edges_global,
+                freq_itemsets[cat], freq_sims_all[cat],
+                DEFAULT_NUM_PATHS, top_k_paths,
+                selection_mode="freq",
+                path_length=DEFAULT_PATH_LENGTH
+            )
+            freq_time += time.time() - t1
+            total_freq += fe
 
-    # print CSV table
-    print("top_k_paths,num_paths,util_comp_time,freq_comp_time,total_high,total_freq")
+        results.append({
+            'top_k_paths': top_k_paths,
+            'num_paths': DEFAULT_NUM_PATHS,
+            'path_length': DEFAULT_PATH_LENGTH,
+            'util_time': util_time,
+            'freq_time': freq_time,
+            'total_high': total_high,
+            'total_freq': total_freq
+        })
+
+    # vary num_paths
+    for num_paths in num_paths_list:
+        total_high = total_freq = util_time = freq_time = 0.0
+        for cat in categories:
+            t0 = time.time()
+            hi = compute_path_utility(
+                G, top5_edges_global,
+                high_itemsets[cat], high_sims_all[cat],
+                num_paths, DEFAULT_K_PATHS,
+                selection_mode="utility",
+                path_length=DEFAULT_PATH_LENGTH
+            )
+            util_time += time.time() - t0
+            total_high += hi
+
+            t1 = time.time()
+            fe = compute_path_utility(
+                G, top5_edges_global,
+                freq_itemsets[cat], freq_sims_all[cat],
+                num_paths, DEFAULT_K_PATHS,
+                selection_mode="freq",
+                path_length=DEFAULT_PATH_LENGTH
+            )
+            freq_time += time.time() - t1
+            total_freq += fe
+
+        results.append({
+            'top_k_paths': DEFAULT_K_PATHS,
+            'num_paths': num_paths,
+            'path_length': DEFAULT_PATH_LENGTH,
+            'util_time': util_time,
+            'freq_time': freq_time,
+            'total_high': total_high,
+            'total_freq': total_freq
+        })
+
+    # vary path_length
+    for path_length in path_lengths_list:
+        total_high = total_freq = util_time = freq_time = 0.0
+        for cat in categories:
+            t0 = time.time()
+            hi = compute_path_utility(
+                G, top5_edges_global,
+                high_itemsets[cat], high_sims_all[cat],
+                DEFAULT_NUM_PATHS, DEFAULT_K_PATHS,
+                selection_mode="utility",
+                path_length=path_length
+            )
+            util_time += time.time() - t0
+            total_high += hi
+
+            t1 = time.time()
+            fe = compute_path_utility(
+                G, top5_edges_global,
+                freq_itemsets[cat], freq_sims_all[cat],
+                DEFAULT_NUM_PATHS, DEFAULT_K_PATHS,
+                selection_mode="freq",
+                path_length=path_length
+            )
+            freq_time += time.time() - t1
+            total_freq += fe
+
+        results.append({
+            'top_k_paths': DEFAULT_K_PATHS,
+            'num_paths': DEFAULT_NUM_PATHS,
+            'path_length': path_length,
+            'util_time': util_time,
+            'freq_time': freq_time,
+            'total_high': total_high,
+            'total_freq': total_freq
+        })
+
+    # print results as CSV
+    print("top_k_paths,num_paths,path_length,util_time,freq_time,total_high,total_freq")
     for r in results:
-        print(f"{r['top_k_paths']},{r['num_paths']},"f"{r['util_comp_time']:.4f},"f"{r['freq_comp_time']:.4f},"f"{r['total_high']:.4f},"f"{r['total_freq']:.4f}")
+        print(f"{r['top_k_paths']},{r['num_paths']},"
+              f"{r['path_length']},{r['util_time']:.2f},"
+              f"{r['freq_time']:.2f},"
+              f"{r['total_high']:.2f},{r['total_freq']:.2f}")
